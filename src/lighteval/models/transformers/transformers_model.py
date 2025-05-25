@@ -1873,8 +1873,8 @@ class TransformersModel(LightevalModel):
                     res.append(
                         RewardModelingResponse(
                             result=(chosen_score, rejected_score),
-                            policy_chosen_logps=policy_chosen_logps[ix].cpu().numpy().tolist(),
-                            policy_rejected_logps=policy_rejected_logps[ix].cpu().numpy().tolist()
+                            policy_chosen_logps=policy_chosen_logps[ix].float().cpu().numpy().tolist(),
+                            policy_rejected_logps=policy_rejected_logps[ix].float().cpu().numpy().tolist()
                         )
                     )
 
