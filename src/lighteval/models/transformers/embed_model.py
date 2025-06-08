@@ -68,6 +68,7 @@ distance_strategy_mapping = {
 class EmbeddingModelConfig(TransformersModelConfig):
     """Configuration for the embedding model."""
 
+    faiss_index_path: Optional[str] = None
     num_chunks: int = 100000
     similarity_fn: str = "cosine"
     top_k: int = 5
@@ -117,7 +118,8 @@ class EmbeddingModel(TransformersModel):
         self.top_k = config.top_k
         self.num_chunks = config.num_chunks
         self.similarity_fn = config.similarity_fn
-        self.vector_db = self._build_knowledge_base()
+        self.vector_db = self._build_knowledge_base(config.faiss_index_path)
+
 
     @property
     def tokenizer(self):
@@ -347,101 +349,115 @@ class EmbeddingModel(TransformersModel):
 
         return docs_processed_unique
 
-    def _build_knowledge_base(self) -> FAISS:
-        ds = load_dataset(self.docs_name_or_path, split="train")
-        knowledge_base = [
-            LangchainDocument(
-                page_content=doc["text"],
-                metadata={"source": doc["source"]}) for doc in tqdm(ds, desc="Loading KB")
-        ]
-
-        docs_processed = self._split_documents(
-             self._max_length, knowledge_base)
-
-        texts = [d.page_content for d in docs_processed]
-        metadatas = [d.metadata for d in docs_processed]
-
-        logger.info(f"Embedding {len(texts)} documents...")
-
-        embeddings = self.model.embed_documents(texts)
-        if not embeddings:
-             raise ValueError("Embedding process yielded no vectors!")
-        dim = len(embeddings[0])
-
-        logger.info(f"Building FAISS IVF-PQ index (dim={dim})...")
-
-        N = len(texts)
-
-        if N == 0:
-            raise ValueError("Cannot build an index with 0 vectors.")
-        elif N < 8:
-            # For very small N, IVF might be overkill or unstable.
-            # A small fixed nlist or even falling back to Flat might be better.
-            # Let's use a minimum of 4 lists if N is sufficient, otherwise just 1.
-            nlist = min(4, N)
-            logger.warning(f"Very small N ({N}). Using nlist={nlist}. Consider using IndexFlatL2 instead.")
-        else:
-            sqrt_n = math.sqrt(N)
-            log2_sqrt_n = math.log2(sqrt_n)
-
-            pow2_low = 2**math.floor(log2_sqrt_n)
-            pow2_high = 2**math.ceil(log2_sqrt_n)
-
-            if sqrt_n - pow2_low < pow2_high - sqrt_n: # Check distance, prefer lower if equidistant
-                closest_pow2 = pow2_low
-            else:
-                closest_pow2 = pow2_high
-
-            nlist = 4 * closest_pow2
-            nlist = max(4, nlist)
-            nlist = min(nlist, N)
-
-        nlist = int(nlist)
-        logger.info(f"Using N={N}, calculated nlist = {nlist} (based on 2 * closest power of 2 to sqrt(N))")
-
-        pq_m = min(32, dim)
-        index_key = f"IVF{nlist},PQ{pq_m}"
-        try:
-            index = faiss.index_factory(dim, index_key)
-        except Exception as e:
-             logger.error(f"Failed to create index factory for {index_key}. Dim={dim}. Error: {e}")
-             # Fallback to FlatL2 if IVF-PQ fails (e.g., dim < pq_m or too few vectors for nlist)
-             logger.warning("Falling back to IndexFlatL2 due to index_factory error.")
-             index = faiss.IndexFlatL2(dim)
-             index_key = "IndexFlatL2"
-
-        # Check if training is required (IVF needs training, Flat does not)
-        if hasattr(index, 'is_trained') and not index.is_trained:
-            logger.info(f"Training FAISS index ({index_key})...")
-            embeddings_np = np.asarray(embeddings, dtype="float32")
-            if embeddings_np.shape[0] < nlist and index_key.startswith("IVF"):
-                 logger.warning(f"Insufficient vectors ({embeddings_np.shape[0]}) to train {nlist} clusters. Reducing nlist.")
-                 # Adjust nlist or fallback - simple fallback shown here
-                 index = faiss.IndexFlatL2(dim)
-                 index_key = "IndexFlatL2 (fallback)"
-                 logger.info(f"Switched to {index_key} due to insufficient training data.")
-            elif index_key.startswith("IVF"): # Only train if IVF and enough data
-                index.train(embeddings_np)
-
-        logger.info(f"Adding vectors to FAISS index ({index_key})...")
-        index.add(np.asarray(embeddings, dtype="float32"))
-        index.nprobe = min(8, nlist) if index_key.startswith("IVF") else 1 # recall/speed knob for IVF
-
-        ids = list(map(str, range(len(texts))))
-        docstore = InMemoryDocstore(dict(zip(ids, docs_processed)))
-        index_to_docstore_id = {i: ids[i] for i in range(len(ids))}
-
-        logger.info(f"Knowledge-base built with {index_key} (nprobe = {getattr(index, 'nprobe', 'N/A')})")
-
-        vector_db = FAISS(
-            embedding_function=self.model.embed_query,
-            index=index,
-            docstore=docstore,
-            index_to_docstore_id=index_to_docstore_id,
-            distance_strategy=distance_strategy_mapping[self.similarity_fn],
-            normalize_L2=(self.similarity_fn == "cosine")
+    def _build_knowledge_base(self, faiss_index_path: Optional[str] = None) -> FAISS:
+      if faiss_index_path and os.path.exists(faiss_index_path):
+        logger.info(f"Loading prebuilt FAISS index from {faiss_index_path}...")
+        return FAISS.load_local(
+            faiss_index_path,
+            self.model.embed_query,
+            allow_dangerous_deserialization=True
         )
-        return vector_db
+
+      ds = load_dataset(self.docs_name_or_path, split="train")
+      knowledge_base = [
+          LangchainDocument(
+              page_content=doc["text"],
+              metadata={"source": doc["source"]}) for doc in tqdm(ds, desc="Loading KB")
+      ]
+
+      docs_processed = self._split_documents(
+            self._max_length, knowledge_base)
+
+      texts = [d.page_content for d in docs_processed]
+      metadatas = [d.metadata for d in docs_processed]
+
+      logger.info(f"Embedding {len(texts)} documents...")
+
+      embeddings = self.model.embed_documents(texts)
+      if not embeddings:
+            raise ValueError("Embedding process yielded no vectors!")
+      dim = len(embeddings[0])
+
+      logger.info(f"Building FAISS IVF-PQ index (dim={dim})...")
+
+      N = len(texts)
+
+      if N == 0:
+          raise ValueError("Cannot build an index with 0 vectors.")
+      elif N < 8:
+          # For very small N, IVF might be overkill or unstable.
+          # A small fixed nlist or even falling back to Flat might be better.
+          # Let's use a minimum of 4 lists if N is sufficient, otherwise just 1.
+          nlist = min(4, N)
+          logger.warning(f"Very small N ({N}). Using nlist={nlist}. Consider using IndexFlatL2 instead.")
+      else:
+          sqrt_n = math.sqrt(N)
+          log2_sqrt_n = math.log2(sqrt_n)
+
+          pow2_low = 2**math.floor(log2_sqrt_n)
+          pow2_high = 2**math.ceil(log2_sqrt_n)
+
+          if sqrt_n - pow2_low < pow2_high - sqrt_n: # Check distance, prefer lower if equidistant
+              closest_pow2 = pow2_low
+          else:
+              closest_pow2 = pow2_high
+
+          nlist = 4 * closest_pow2
+          nlist = max(4, nlist)
+          nlist = min(nlist, N)
+
+      nlist = int(nlist)
+      logger.info(f"Using N={N}, calculated nlist = {nlist} (based on 2 * closest power of 2 to sqrt(N))")
+
+      pq_m = min(32, dim)
+      index_key = f"IVF{nlist},PQ{pq_m}"
+      try:
+          index = faiss.index_factory(dim, index_key)
+      except Exception as e:
+            logger.error(f"Failed to create index factory for {index_key}. Dim={dim}. Error: {e}")
+            # Fallback to FlatL2 if IVF-PQ fails (e.g., dim < pq_m or too few vectors for nlist)
+            logger.warning("Falling back to IndexFlatL2 due to index_factory error.")
+            index = faiss.IndexFlatL2(dim)
+            index_key = "IndexFlatL2"
+
+      # Check if training is required (IVF needs training, Flat does not)
+      if hasattr(index, 'is_trained') and not index.is_trained:
+          logger.info(f"Training FAISS index ({index_key})...")
+          embeddings_np = np.asarray(embeddings, dtype="float32")
+          if embeddings_np.shape[0] < nlist and index_key.startswith("IVF"):
+                logger.warning(f"Insufficient vectors ({embeddings_np.shape[0]}) to train {nlist} clusters. Reducing nlist.")
+                # Adjust nlist or fallback - simple fallback shown here
+                index = faiss.IndexFlatL2(dim)
+                index_key = "IndexFlatL2 (fallback)"
+                logger.info(f"Switched to {index_key} due to insufficient training data.")
+          elif index_key.startswith("IVF"): # Only train if IVF and enough data
+              index.train(embeddings_np)
+
+      logger.info(f"Adding vectors to FAISS index ({index_key})...")
+      index.add(np.asarray(embeddings, dtype="float32"))
+      index.nprobe = min(8, nlist) if index_key.startswith("IVF") else 1 # recall/speed knob for IVF
+
+      ids = list(map(str, range(len(texts))))
+      docstore = InMemoryDocstore(dict(zip(ids, docs_processed)))
+      index_to_docstore_id = {i: ids[i] for i in range(len(ids))}
+
+      logger.info(f"Knowledge-base built with {index_key} (nprobe = {getattr(index, 'nprobe', 'N/A')})")
+
+      vector_db = FAISS(
+          embedding_function=self.model.embed_query,
+          index=index,
+          docstore=docstore,
+          index_to_docstore_id=index_to_docstore_id,
+          distance_strategy=distance_strategy_mapping[self.similarity_fn],
+          normalize_L2=(self.similarity_fn == "cosine")
+      )
+
+      if faiss_index_path:
+        logger.info(f"Saving FAISS index to {faiss_index_path}...")
+        os.makedirs(os.path.dirname(faiss_index_path), exist_ok=True)
+        vector_db.save_local(faiss_index_path)
+
+      return vector_db
 
     def run_model(
         self,
